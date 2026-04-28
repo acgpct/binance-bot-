@@ -430,44 +430,121 @@ with left:
     else:
         plot_df = hist.copy()
         plot_df["btc_benchmark"] = starting_cash * (plot_df["btc_price"] / plot_df["btc_price"].iloc[0])
+        # Append a "now" point so the chart extends to the present
         now_row = pd.DataFrame([{
             "timestamp": datetime.now(timezone.utc),
             "equity": equity,
+            "cash": cash,
+            "btc_price": btc_now,
+            "n_positions": len(holdings),
+            "holdings": "|".join(holdings.keys()),
             "btc_benchmark": starting_cash * (btc_now / plot_df["btc_price"].iloc[0]),
         }])
         plot_df = pd.concat([plot_df, now_row], ignore_index=True)
 
+        # Per-point derived columns for the rich hover tooltip
+        plot_df["return_pct"] = (plot_df["equity"] / starting_cash - 1) * 100
+        plot_df["btc_pct"] = (plot_df["btc_benchmark"] / starting_cash - 1) * 100
+        plot_df["edge_pct"] = plot_df["return_pct"] - plot_df["btc_pct"]
+        plot_df["pnl_dollars"] = plot_df["equity"] - starting_cash
+        peak = plot_df["equity"].cummax()
+        plot_df["drawdown_pct"] = (plot_df["equity"] / peak - 1) * 100
+        plot_df["holdings_pretty"] = plot_df["holdings"].fillna("").str.replace("|", " · ").str.replace("/USDT", "")
+        plot_df["holdings_pretty"] = plot_df["holdings_pretty"].apply(lambda s: s if s else "—")
+
+        # custom_data is what we pass into hovertemplate
+        custom = plot_df[["pnl_dollars", "return_pct", "btc_pct", "edge_pct",
+                          "drawdown_pct", "n_positions", "holdings_pretty"]].to_numpy()
+
+        strategy_hover = (
+            "<span style='font-size:13px;color:#0f172a;font-weight:600'>%{x|%a %d %b · %H:%M}</span>"
+            "<br><span style='color:#64748b;font-size:11px'>EQUITY</span>"
+            "<br><span style='font-size:15px;font-weight:600'>$%{y:,.2f}</span>"
+            "<span style='color:#64748b;font-size:11px'> &nbsp;(%{customdata[0]:+,.2f})</span>"
+            "<br><br>"
+            "<span style='color:#64748b;font-size:11px'>vs start</span> &nbsp; "
+            "<span style='font-weight:500'>%{customdata[1]:+.2f}%</span>"
+            "<br>"
+            "<span style='color:#64748b;font-size:11px'>vs BTC HODL</span> &nbsp; "
+            "<span style='font-weight:500'>%{customdata[3]:+.2f}%</span>"
+            "<br>"
+            "<span style='color:#64748b;font-size:11px'>drawdown</span> &nbsp; "
+            "<span style='font-weight:500'>%{customdata[4]:.2f}%</span>"
+            "<br>"
+            "<span style='color:#64748b;font-size:11px'>positions (%{customdata[5]})</span> &nbsp; "
+            "<span style='font-weight:500'>%{customdata[6]}</span>"
+            "<extra></extra>"
+        )
+        btc_hover = (
+            "<span style='font-size:13px;color:#0f172a;font-weight:600'>%{x|%a %d %b · %H:%M}</span>"
+            "<br><span style='color:#64748b;font-size:11px'>BTC HODL benchmark</span>"
+            "<br><span style='font-size:15px;font-weight:600'>$%{y:,.2f}</span>"
+            "<br><span style='color:#64748b;font-size:11px'>vs start</span> &nbsp; "
+            "<span style='font-weight:500'>%{customdata[2]:+.2f}%</span>"
+            "<extra></extra>"
+        )
+
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=plot_df["timestamp"], y=plot_df["equity"],
-            name="Strategy", mode="lines",
+            name="Strategy", mode="lines+markers",
             line={"color": INK, "width": 2.2, "shape": "spline"},
+            marker={"size": 6, "color": INK, "line": {"color": CARD, "width": 1.5}},
             fill="tozeroy",
             fillcolor="rgba(15,23,42,0.04)",
-            hovertemplate="%{x|%a %d %b %H:%M}<br><b>$%{y:,.2f}</b><extra></extra>",
+            customdata=custom,
+            hovertemplate=strategy_hover,
+            hoverlabel={"bgcolor": CARD, "bordercolor": HAIR, "font": {"family": "Geist", "size": 12, "color": INK}, "align": "left"},
         ))
         fig.add_trace(go.Scatter(
             x=plot_df["timestamp"], y=plot_df["btc_benchmark"],
             name="BTC HODL", mode="lines",
             line={"color": SUBTLE, "width": 1.4, "dash": "dot"},
-            hovertemplate="%{x|%a %d %b %H:%M}<br><b>$%{y:,.2f}</b><extra></extra>",
+            customdata=custom,
+            hovertemplate=btc_hover,
+            hoverlabel={"bgcolor": CARD, "bordercolor": HAIR, "font": {"family": "Geist", "size": 12, "color": INK}, "align": "left"},
         ))
-        fig.add_hline(y=starting_cash, line_dash="dash", line_color=HAIR,
-                      annotation_text=f"start", annotation_position="right",
-                      annotation_font={"size": 10, "color": SUBTLE})
+        fig.add_hline(
+            y=starting_cash, line_dash="dash", line_color=HAIR,
+            annotation_text="start",
+            annotation_position="right",
+            annotation_font={"size": 10, "color": SUBTLE},
+        )
 
         ymin = min(plot_df["equity"].min(), plot_df["btc_benchmark"].min(), starting_cash) * 0.97
         ymax = max(plot_df["equity"].max(), plot_df["btc_benchmark"].max(), starting_cash) * 1.03
+
+        # Range selector buttons (only useful with enough history)
+        rangeselector = None
+        span_days = (plot_df["timestamp"].max() - plot_df["timestamp"].min()).total_seconds() / 86400
+        if span_days >= 2:
+            rangeselector = {
+                "buttons": [
+                    {"count": 1, "label": "1d", "step": "day", "stepmode": "backward"},
+                    {"count": 7, "label": "1w", "step": "day", "stepmode": "backward"},
+                    {"count": 30, "label": "1m", "step": "day", "stepmode": "backward"},
+                    {"step": "all", "label": "all"},
+                ],
+                "bgcolor": SOFT, "activecolor": INK,
+                "bordercolor": HAIR, "borderwidth": 1,
+                "font": {"size": 11, "color": MUTED},
+                "x": 0, "y": 1.04,
+            }
+
         fig.update_layout(
-            height=360, hovermode="x unified",
+            height=400,
+            hovermode="closest",
             yaxis={"title": None, "gridcolor": HAIR, "tickprefix": "$", "tickformat": ",.0f",
-                   "range": [ymin, ymax], "showgrid": True, "zeroline": False},
-            xaxis={"title": None, "showgrid": False, "tickformat": "%d %b"},
-            legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0,
+                   "range": [ymin, ymax], "showgrid": True, "zeroline": False, "fixedrange": False},
+            xaxis={"title": None, "showgrid": False, "tickformat": "%d %b",
+                   "rangeselector": rangeselector,
+                   "showspikes": True, "spikecolor": HAIR, "spikethickness": 1, "spikemode": "across", "spikedash": "dot"},
+            legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0 if rangeselector is None else 0.5,
                     "bgcolor": "rgba(0,0,0,0)", "font": {"size": 11, "color": MUTED}},
             **PLOT_LAYOUT,
         )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig, use_container_width=True,
+                        config={"displayModeBar": False, "scrollZoom": True})
 
 with right:
     st.markdown("## Portfolio mix")

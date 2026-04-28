@@ -18,5 +18,7 @@ data/*.parquet
 # --- Runtime state & logs (machine-specific) ---
 data/*.csv
 data/*.json
+data/*.txt
+data/weekly_reports/
 *.log
 *.pid

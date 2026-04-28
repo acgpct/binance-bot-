@@ -457,6 +457,41 @@ bash deploy/sync_from_vps.sh <VPS-IP>
 # Then refresh the dashboard tab
 ```
 
+### Weekly summary notification (macOS)
+
+Get a desktop notification every Sunday at 18:00 with your weekly P&L,
+week-over-week change, vs-BTC edge, holdings, best/worst coin, and any
+drawdown alerts — all without opening the dashboard.
+
+Install once:
+
+```bash
+bash tools/install_weekly_notification.sh
+# enter your VPS IP if prompted (optional, for auto-sync)
+```
+
+Test it now (instead of waiting for Sunday):
+
+```bash
+bash tools/run_weekly_summary.sh
+# A macOS notification should appear within a few seconds.
+```
+
+The full report is saved to `data/weekly_reports/<date>.txt` and appended
+to `data/weekly_reports/all_reports.log` so you have a running history.
+
+Uninstall:
+
+```bash
+bash tools/uninstall_weekly_notification.sh
+```
+
+How it works: a `launchd` agent (`~/Library/LaunchAgents/com.user.binance-bot.weekly-summary.plist`)
+calls `tools/run_weekly_summary.sh` on the schedule. The wrapper optionally
+syncs from VPS first (if you set up passwordless SSH), runs
+`tools/weekly_summary.py`, saves the report, and pops a notification via
+`osascript`. No external apps required.
+
 ### Update the bot after a code change
 
 ```bash
@@ -565,6 +600,7 @@ emotional limits are while it's still cheap.
 - [x] **Defensive sells** — `min(state, actual_balance)`
 - [x] **VPS deployment** — `deploy/setup.sh` + systemd unit
 - [x] **Sync script** — pull state from VPS to Mac for the dashboard
+- [x] **Weekly summary notification** — `launchd` job posts a macOS notification every Sunday
 - [ ] Bull/bear regime filter (only trade when BTC is uptrending)
 - [ ] Include delisted coins in candidate pool (truly bias-free backtest)
 - [ ] Multi-lookback momentum (combine 20/40/60-bar ranks for robustness)
