@@ -1,0 +1,227 @@
+"""Rotational momentum backtest: at each rebalance bar, pick the top-ranked coin
+from the universe and hold it. Switch when a different coin tops the ranking.
+
+Run:  python -m src.rotation_backtest --top 20 --timeframe 4h --days 60 --rebalance-bars 6
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import pandas as pd
+
+from src.data import fetch_history, load, save
+from src.exchange import get_data_exchange
+from src.scanner import get_universe, score
+
+FEE_RATE = 0.001  # 0.1% per trade
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+
+def _ensure_data(exchange, universe: list[dict], timeframe: str, days: int) -> dict[str, pd.DataFrame]:
+    """Fetch & cache OHLCV for every coin in the universe."""
+    out = {}
+    for entry in universe:
+        sym = entry["symbol"]
+        df = load(sym, timeframe)
+        if df is None or len(df) < 100 or (df.index[-1] - df.index[0]).days < days * 0.7:
+            try:
+                df = fetch_history(exchange, sym, timeframe, days=days)
+                save(df, sym, timeframe)
+            except Exception as e:  # noqa: BLE001
+                print(f"  [skip {sym}: {e}]")
+                continue
+        if df is not None and len(df) > 50:
+            out[sym] = df
+    return out
+
+
+def _aligned_close_panel(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Single DataFrame: rows = timestamps, cols = symbols, values = close price (forward-filled)."""
+    closes = pd.DataFrame({sym: df["close"] for sym, df in data.items()})
+    return closes.sort_index().ffill()
+
+
+def run(data: dict[str, pd.DataFrame], rebalance_bars: int = 6,
+        momentum_lookback: int = 20, ema_short: int = 20, ema_long: int = 50,
+        top_k: int = 1, starting_cash: float = 10_000.0,
+        skip_top_n: int = 0, volatility_weighted: bool = False,
+        trailing_stop_pct: float = 0.0) -> dict:
+    """Rotational momentum simulation.
+
+    skip_top_n           — skip the N most-pumped picks (avoids buying the very top)
+    volatility_weighted  — size positions inversely to ATR% (less in volatile coins)
+    trailing_stop_pct    — between rebalances, sell any coin that drops this % from
+                           its post-entry high. The freed cash sits idle until the
+                           next rebalance.
+    """
+    closes = _aligned_close_panel(data)
+    if len(closes) == 0:
+        raise ValueError("No data to backtest.")
+
+    cash = starting_cash
+    # holdings: sym -> {units, peak_price}
+    holdings: dict[str, dict] = {}
+    equity_curve = []
+    trades = []
+    last_picks: list[str] = []
+
+    warmup = max(ema_long, momentum_lookback) + 5
+
+    for i, ts in enumerate(closes.index):
+        prices = closes.loc[ts]
+
+        # Trailing stop check on every bar (not just rebalance bars)
+        if trailing_stop_pct and holdings:
+            for sym in list(holdings.keys()):
+                px = float(prices.get(sym, 0) or 0)
+                if px <= 0:
+                    continue
+                holdings[sym]["peak_price"] = max(holdings[sym]["peak_price"], px)
+                if px <= holdings[sym]["peak_price"] * (1 - trailing_stop_pct):
+                    proceeds = holdings[sym]["units"] * px * (1 - FEE_RATE)
+                    cash += proceeds
+                    trades.append({"timestamp": ts, "side": "SELL", "symbol": sym,
+                                   "price": px, "units": holdings[sym]["units"],
+                                   "reason": "TRAILING_STOP"})
+                    del holdings[sym]
+
+        position_value = sum(h["units"] * float(prices.get(sym, 0) or 0)
+                             for sym, h in holdings.items())
+        equity_curve.append(cash + position_value)
+
+        if i < warmup:
+            continue
+        if (i - warmup) % rebalance_bars != 0:
+            continue
+
+        # Score every coin using ONLY data available up to and including ts
+        scores = []
+        for sym, df in data.items():
+            slice_df = df.loc[:ts]
+            if len(slice_df) < ema_long + 5:
+                continue
+            s = score(slice_df, momentum_lookback=momentum_lookback,
+                      ema_short=ema_short, ema_long=ema_long)
+            if s is None or not s["in_uptrend"]:
+                continue
+            s["symbol"] = sym
+            s["price"] = float(prices.get(sym, 0) or 0)
+            if s["price"] > 0:
+                scores.append(s)
+
+        scores.sort(key=lambda x: x["momentum_pct"], reverse=True)
+        # Skip the most-pumped (most extended) coins, then take the next top_k
+        eligible = scores[skip_top_n : skip_top_n + top_k]
+        pick_symbols = [s["symbol"] for s in eligible]
+
+        # Sell holdings no longer in picks
+        for sym in list(holdings.keys()):
+            if sym not in pick_symbols:
+                px = float(prices.get(sym, 0) or 0)
+                if px > 0:
+                    proceeds = holdings[sym]["units"] * px * (1 - FEE_RATE)
+                    cash += proceeds
+                    trades.append({"timestamp": ts, "side": "SELL", "symbol": sym,
+                                   "price": px, "units": holdings[sym]["units"],
+                                   "reason": "ROTATION"})
+                del holdings[sym]
+
+        # Buy any pick we don't already hold, distributing the available cash
+        # by either equal weight or inverse-ATR (volatility-weighted) sizing.
+        new_eligibles = [s for s in eligible if s["symbol"] not in holdings]
+        if new_eligibles and cash > 1.0:
+            if volatility_weighted:
+                inv_atr = [1.0 / max(s["atr_pct"], 0.5) for s in new_eligibles]
+                tot = sum(inv_atr)
+                weights = [w / tot for w in inv_atr]
+            else:
+                weights = [1.0 / len(new_eligibles)] * len(new_eligibles)
+
+            cash_to_deploy = cash
+            for s, w in zip(new_eligibles, weights):
+                sym = s["symbol"]
+                px = float(prices.get(sym, 0) or 0)
+                if px <= 0:
+                    continue
+                spend = cash_to_deploy * w
+                if spend < 1.0 or spend > cash:
+                    spend = min(spend, cash)
+                units = (spend * (1 - FEE_RATE)) / px
+                holdings[sym] = {"units": units, "peak_price": px}
+                cash -= spend
+                trades.append({"timestamp": ts, "side": "BUY", "symbol": sym,
+                               "price": px, "units": units, "reason": "ROTATION"})
+
+        last_picks = pick_symbols
+
+    equity = pd.Series(equity_curve, index=closes.index, name="equity")
+    trades_df = pd.DataFrame(trades)
+
+    rolling_max = equity.cummax()
+    drawdown = (equity - rolling_max) / rolling_max
+    max_dd = drawdown.min() * 100 if len(drawdown) else 0.0
+
+    return {
+        "equity_curve": equity,
+        "trades": trades_df,
+        "final_equity": equity.iloc[-1],
+        "return_pct": (equity.iloc[-1] / starting_cash - 1) * 100,
+        "max_drawdown_pct": max_dd,
+        "n_trades": len(trades_df),
+        "n_switches": len(trades_df[trades_df["side"] == "BUY"]),
+        "last_picks": last_picks,
+        "symbols_traded": sorted(trades_df["symbol"].unique().tolist()) if len(trades_df) else [],
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--top", type=int, default=20, help="Universe size")
+    parser.add_argument("--timeframe", default="4h")
+    parser.add_argument("--days", type=int, default=60)
+    parser.add_argument("--rebalance-bars", type=int, default=6,
+                        help="Rebalance every N bars (e.g. 6 bars on 4h = daily)")
+    parser.add_argument("--momentum-lookback", type=int, default=20)
+    parser.add_argument("--ema-short", type=int, default=20)
+    parser.add_argument("--ema-long", type=int, default=50)
+    parser.add_argument("--top-k", type=int, default=1, help="Hold top K coins, equal-weighted")
+    parser.add_argument("--cash", type=float, default=10_000.0)
+    parser.add_argument("--min-volume", type=float, default=5_000_000)
+    args = parser.parse_args()
+
+    ex = get_data_exchange()
+    universe = get_universe(ex, top_n=args.top, min_volume_usd=args.min_volume)
+    print(f"Universe ({len(universe)} coins): {', '.join(p['symbol'] for p in universe)}")
+    print(f"Fetching history (this may take a minute, cached after first run)...")
+
+    data = _ensure_data(ex, universe, args.timeframe, args.days)
+    print(f"Got data for {len(data)} coins")
+
+    result = run(
+        data, rebalance_bars=args.rebalance_bars,
+        momentum_lookback=args.momentum_lookback,
+        ema_short=args.ema_short, ema_long=args.ema_long,
+        top_k=args.top_k, starting_cash=args.cash,
+    )
+
+    btc = data.get("BTC/USDT")
+    btc_hold = ((btc["close"].iloc[-1] / btc["close"].iloc[0]) - 1) * 100 if btc is not None else float("nan")
+
+    print()
+    print(f"Strategy:       Rotational momentum (top {args.top_k} of {args.top})")
+    print(f"Timeframe:      {args.timeframe}, rebalance every {args.rebalance_bars} bars")
+    print(f"Period:         {result['equity_curve'].index[0]} → {result['equity_curve'].index[-1]}")
+    print(f"Starting:       ${args.cash:,.2f}")
+    print(f"Final equity:   ${result['final_equity']:,.2f}")
+    print(f"Return:         {result['return_pct']:+.2f}%")
+    print(f"Max drawdown:   {result['max_drawdown_pct']:.2f}%")
+    print(f"Switches:       {result['n_switches']}")
+    print(f"Coins traded:   {len(result['symbols_traded'])} ({', '.join(result['symbols_traded'][:8])}{'...' if len(result['symbols_traded'])>8 else ''})")
+    print(f"Currently:      {result['last_picks']}")
+    print(f"BTC buy & hold: {btc_hold:+.2f}%   (benchmark)")
+
+
+if __name__ == "__main__":
+    main()

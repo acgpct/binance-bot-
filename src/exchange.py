@@ -36,3 +36,17 @@ def get_exchange() -> ccxt.binance:
 
 def is_live() -> bool:
     return os.getenv("BINANCE_LIVE", "false").lower() == "true"
+
+
+def get_data_exchange() -> ccxt.binance:
+    """Public, unauthenticated mainnet client — used for scanning & backtesting.
+
+    Binance Spot Testnet only retains ~25 days of intraday history and a small
+    subset of pairs. For a multi-coin scanner, we read market data from mainnet
+    (no API key needed for public endpoints) and only route orders through the
+    authenticated testnet client.
+    """
+    return ccxt.binance({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    })

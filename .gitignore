@@ -1,10 +1,22 @@
+# --- Secrets ---
 .env
+
+# --- Python ---
 .venv/
 venv/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-data/*.parquet
-data/*.csv
+
+# --- OS / editors ---
 .DS_Store
 .vscode/
+
+# --- Cached market data (regenerable) ---
+data/*.parquet
+
+# --- Runtime state & logs (machine-specific) ---
+data/*.csv
+data/*.json
+*.log
+*.pid
