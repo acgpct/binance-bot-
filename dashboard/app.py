@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 STATE_PATH = ROOT / "data" / "rotation_state.json"
 EQUITY_LOG_PATH = ROOT / "data" / "equity_history.csv"
 DASH_CONFIG_PATH = ROOT / "data" / "dashboard_config.json"
+DCA_HISTORY_PATH = ROOT / "data" / "dca_history.csv"
 
 # ---------- Minimalist palette ----------
 INK = "#0f172a"           # near-black for headlines
@@ -745,6 +746,113 @@ else:
         },
         use_container_width=True, hide_index=True,
     )
+
+
+# ---------- DCA bot section (only if there's any history) ----------
+if DCA_HISTORY_PATH.exists():
+    dca_hist = pd.read_csv(DCA_HISTORY_PATH, parse_dates=["timestamp"])
+    if len(dca_hist):
+        st.markdown("## DCA bot — stocks/ETFs")
+
+        # Aggregate per-ticker stats
+        dca_hist = dca_hist.sort_values("timestamp")
+        per_ticker = dca_hist.groupby("ticker").agg(
+            shares_bought=("shares", "sum"),
+            total_invested=("actual_amount", "sum"),
+            n_buys=("shares", "count"),
+            avg_cost=("price", lambda s: (dca_hist.loc[s.index, "actual_amount"].sum()
+                                          / dca_hist.loc[s.index, "shares"].sum())
+                                          if dca_hist.loc[s.index, "shares"].sum() > 0 else 0),
+        ).reset_index()
+
+        # Try to get a current price for each (uses yfinance — best effort)
+        @st.cache_data(ttl=120)
+        def _yf_price(ticker: str) -> float:
+            try:
+                import yfinance as yf
+                t = yf.Ticker(ticker)
+                p = getattr(t.fast_info, "last_price", None)
+                if p:
+                    return float(p)
+                h = t.history(period="2d")
+                if len(h):
+                    return float(h["Close"].iloc[-1])
+            except Exception:
+                pass
+            return 0.0
+
+        per_ticker["current_price"] = per_ticker["ticker"].map(_yf_price)
+        per_ticker["current_value"] = per_ticker["shares_bought"] * per_ticker["current_price"]
+        per_ticker["pnl_pct"] = (
+            (per_ticker["current_value"] / per_ticker["total_invested"] - 1) * 100
+        ).where(per_ticker["total_invested"] > 0, 0)
+        per_ticker["pnl_usd"] = per_ticker["current_value"] - per_ticker["total_invested"]
+
+        total_invested = float(per_ticker["total_invested"].sum())
+        total_current = float(per_ticker["current_value"].sum())
+        dca_pnl = total_current - total_invested
+        dca_pct = (total_current / total_invested - 1) * 100 if total_invested > 0 else 0
+
+        # KPI row
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            st.metric("Total invested", f"${total_invested:,.2f}")
+        with d2:
+            st.metric("Current value", f"${total_current:,.2f}")
+        with d3:
+            st.metric("DCA P&L", f"${dca_pnl:+,.2f}", f"{dca_pct:+.2f}%")
+        with d4:
+            st.metric("Buys to date", f"{len(dca_hist)}")
+
+        # Per-ticker breakdown
+        st.markdown("##### Per-ticker holdings")
+        display = per_ticker[["ticker", "n_buys", "shares_bought", "avg_cost",
+                              "current_price", "total_invested", "current_value",
+                              "pnl_usd", "pnl_pct"]].rename(columns={
+            "ticker": "Ticker", "n_buys": "Buys",
+            "shares_bought": "Shares", "avg_cost": "Avg cost",
+            "current_price": "Current",
+            "total_invested": "Invested", "current_value": "Value",
+            "pnl_usd": "P&L $", "pnl_pct": "P&L %",
+        })
+        st.dataframe(
+            display,
+            column_config={
+                "Shares": st.column_config.NumberColumn(format="%.4f"),
+                "Avg cost": st.column_config.NumberColumn(format="$%.4f"),
+                "Current": st.column_config.NumberColumn(format="$%.4f"),
+                "Invested": st.column_config.NumberColumn(format="$%,.2f"),
+                "Value": st.column_config.NumberColumn(format="$%,.2f"),
+                "P&L $": st.column_config.NumberColumn(format="$%+,.2f"),
+                "P&L %": st.column_config.NumberColumn(format="%+.2f%%"),
+            },
+            use_container_width=True, hide_index=True,
+        )
+
+        # Recent buys
+        st.markdown("##### Recent DCA buys")
+        recent = dca_hist.tail(15).iloc[::-1].copy()
+        recent["When"] = recent["timestamp"].dt.strftime("%a %d %b %H:%M")
+        recent_display = recent[["When", "ticker", "mode", "actual_amount",
+                                  "shares", "price", "multiplier", "weekly_return_pct"]].rename(
+            columns={
+                "ticker": "Ticker", "mode": "Mode",
+                "actual_amount": "Spent", "shares": "Shares",
+                "price": "Price", "multiplier": "Mult.",
+                "weekly_return_pct": "S&P week %",
+            }
+        )
+        st.dataframe(
+            recent_display,
+            column_config={
+                "Spent": st.column_config.NumberColumn(format="$%,.2f"),
+                "Shares": st.column_config.NumberColumn(format="%.4f"),
+                "Price": st.column_config.NumberColumn(format="$%.4f"),
+                "Mult.": st.column_config.NumberColumn(format="%.2fx"),
+                "S&P week %": st.column_config.NumberColumn(format="%+.2f%%"),
+            },
+            use_container_width=True, hide_index=True,
+        )
 
 
 # ---------- Footer ----------

@@ -595,6 +595,28 @@ emotional limits are while it's still cheap.
 
 ---
 
+## DCA bot for stocks/ETFs (bonus)
+
+The repo includes a second bot that auto-buys ETFs every Friday with an
+optional **tactical multiplier** (buys more when the market is down).
+Diversifies your portfolio away from pure-crypto exposure.
+
+📖 **Full guide: [`deploy/DCA.md`](deploy/DCA.md)**
+
+Three modes: `simulation` (no broker, just logs), `paper` (IBKR paper
+trading), `live` (real money via Interactive Brokers). Start in
+simulation — it lets you validate the strategy without an IBKR account
+or any real money.
+
+```bash
+.venv/bin/python -m src.dca_bot --dry-run         # preview
+.venv/bin/python -m src.dca_bot                   # buy in simulation mode
+bash tools/install_dca_schedule.sh                # schedule weekly Fri 16:00
+```
+
+The dashboard adds a **DCA bot** section showing total invested, current
+value, P&L per ticker, and recent buys.
+
 ## Roadmap
 
 - [x] **Fix survivorship bias in backtests** — point-in-time universe via `--bias-aware`
@@ -604,6 +626,7 @@ emotional limits are while it's still cheap.
 - [x] **Sync script** — pull state from VPS to Mac for the dashboard
 - [x] **Weekly summary notification** — `launchd` job posts a macOS notification every Sunday
 - [x] **True P&L tracking** — `units_bought` + `cost_basis` preserved through reconcile so the dashboard shows real strategy performance, not testnet-seed-inflated numbers
+- [x] **DCA bot for stocks/ETFs** — `src/dca_bot.py` with simulation/paper/live modes + tactical multiplier
 - [ ] Bull/bear regime filter (only trade when BTC is uptrending)
 - [ ] Include delisted coins in candidate pool (truly bias-free backtest)
 - [ ] Multi-lookback momentum (combine 20/40/60-bar ranks for robustness)
