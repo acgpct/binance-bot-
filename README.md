@@ -213,7 +213,9 @@ ensures the in-memory state matches what's actually on the exchange.
 
 ## The dashboard
 
-`dashboard/app.py` (Streamlit) shows:
+📖 **Full dashboard guide: [`dashboard/DASHBOARD.md`](dashboard/DASHBOARD.md)** — covers every section, what to look for, sidebar controls, and troubleshooting.
+
+Quick overview: `dashboard/app.py` (Streamlit) shows:
 
 | Section | What it shows | Where the data comes from |
 |---|---|---|
