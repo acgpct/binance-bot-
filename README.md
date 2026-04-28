@@ -187,6 +187,20 @@ Other useful flags:
 - `--show-picks` — print current picks and exit
 - `--once` — run a single rebalance cycle then exit
 
+### Run it 24/7 on a VPS (so you can close your laptop)
+
+When you're ready to stop running it on your Mac, the repo includes a
+turnkey deployment to a $4/month Linux server. See
+[`deploy/DEPLOY.md`](deploy/DEPLOY.md) for the full walkthrough — about
+15 minutes end-to-end.
+
+Highlights:
+- One-shot setup script (`deploy/setup.sh`) provisions a fresh Ubuntu droplet
+- `systemd` service auto-restarts on crashes and survives reboots
+- Logs via `journalctl -u binance-bot -f`
+- Your local Streamlit dashboard keeps working because it queries the
+  exchange directly, not the bot's local state
+
 ### Going live (eventually)
 
 After **at least 30 days** of testnet running where the live results track

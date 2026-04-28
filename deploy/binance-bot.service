@@ -1,0 +1,34 @@
+[Unit]
+Description=Binance rotational momentum bot
+Documentation=https://github.com/acgpct/binance-bot-
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/home/botuser/binance-bot-
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/botuser/binance-bot-/.venv/bin/python -m src.rotation_bot
+
+# Restart policy: keep the bot alive across crashes and network blips
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Hardening — limit what the process can do
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/botuser/binance-bot-/data /home/botuser/binance-bot-
+
+# Logging via journald (use `journalctl -u binance-bot` to view)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=binance-bot
+
+[Install]
+WantedBy=multi-user.target
