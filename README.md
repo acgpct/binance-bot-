@@ -603,6 +603,7 @@ emotional limits are while it's still cheap.
 - [x] **VPS deployment** — `deploy/setup.sh` + systemd unit
 - [x] **Sync script** — pull state from VPS to Mac for the dashboard
 - [x] **Weekly summary notification** — `launchd` job posts a macOS notification every Sunday
+- [x] **True P&L tracking** — `units_bought` + `cost_basis` preserved through reconcile so the dashboard shows real strategy performance, not testnet-seed-inflated numbers
 - [ ] Bull/bear regime filter (only trade when BTC is uptrending)
 - [ ] Include delisted coins in candidate pool (truly bias-free backtest)
 - [ ] Multi-lookback momentum (combine 20/40/60-bar ranks for robustness)

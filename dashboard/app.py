@@ -287,6 +287,7 @@ def fetch_ticker(symbol: str) -> dict:
 
 
 def current_equity(holdings: dict) -> tuple[float, float, dict]:
+    """Equity using actual exchange units (includes any testnet seed coins)."""
     bal = fetch_balance()
     cash = float(bal.get("USDT", {}).get("free", 0.0))
     pos_values = {}
@@ -297,6 +298,21 @@ def current_equity(holdings: dict) -> tuple[float, float, dict]:
         except Exception:
             pos_values[sym] = 0.0
     return cash, cash + sum(pos_values.values()), pos_values
+
+
+def true_equity(holdings: dict, cash: float) -> tuple[float, dict]:
+    """Equity using only what the bot actually bought (units_bought × current price).
+    Excludes testnet-seeded balances. Falls back to `units` if `units_bought`
+    isn't tracked yet (legacy positions)."""
+    pos_values = {}
+    for sym, info in holdings.items():
+        try:
+            t = fetch_ticker(sym)
+            units_bought = float(info.get("units_bought", info.get("units", 0)))
+            pos_values[sym] = units_bought * float(t["last"])
+        except Exception:
+            pos_values[sym] = 0.0
+    return cash + sum(pos_values.values()), pos_values
 
 
 # ---------- Sidebar ----------
@@ -327,6 +343,12 @@ last_reb = state.get("last_rebalance")
 cash, equity, pos_values = current_equity(holdings)
 pnl_usd = equity - starting_cash
 pnl_pct = (equity / starting_cash - 1) * 100 if starting_cash > 0 else 0.0
+
+# True P&L — what the strategy actually did, ignoring testnet seed coins
+true_eq, true_pos_values = true_equity(holdings, cash)
+true_pnl = true_eq - starting_cash
+true_pnl_pct = (true_eq / starting_cash - 1) * 100 if starting_cash > 0 else 0.0
+seed_inflation = equity - true_eq    # > 0 if testnet seeded extra coins
 hist = load_equity_history()
 btc_now = float(fetch_ticker("BTC/USDT")["last"])
 btc_at_start = float(hist["btc_price"].iloc[0]) if len(hist) and hist["btc_price"].iloc[0] > 0 else btc_now
@@ -368,10 +390,25 @@ st.markdown(
 )
 
 
-# ---------- Hero P&L card ----------
-pnl_color = GREEN if pnl_usd >= 0 else RED
-pnl_sign = "+" if pnl_usd >= 0 else "−"
-pnl_label = "Profit" if pnl_usd >= 0 else "Loss"
+# ---------- Hero P&L card (uses TRUE P&L by default; shows inflation hint on testnet) ----------
+true_pnl_color = GREEN if true_pnl >= 0 else RED
+true_pnl_sign = "+" if true_pnl >= 0 else "−"
+true_label = "Profit" if true_pnl >= 0 else "Loss"
+
+# Note shown if there's meaningful testnet seed inflation
+inflation_note = ""
+if not is_live() and abs(seed_inflation) > 50:
+    direction = "inflated by" if seed_inflation > 0 else "reduced by"
+    inflation_note = (
+        f"<div style='color:{MUTED}; font-size:0.72rem; margin-top:14px; "
+        f"padding-top:14px; border-top:1px solid {HAIR};'>"
+        f"<span style='color:{AMBER};'>⚠</span> Testnet account total: "
+        f"<strong style='color:{INK}; font-feature-settings:tnum;'>${equity:,.2f}</strong> "
+        f"({direction} <strong style='color:{INK};'>${abs(seed_inflation):,.2f}</strong> "
+        f"of free testnet seed coins). The number above is what the strategy "
+        f"actually did — what you'd see on real Binance."
+        f"</div>"
+    )
 
 st.markdown(
     f"""
@@ -382,15 +419,16 @@ st.markdown(
           <div class="hero-value">${starting_cash:,.2f}</div>
         </div>
         <div>
-          <div class="hero-label">Current value</div>
-          <div class="hero-value">${equity:,.2f}</div>
+          <div class="hero-label">Strategy value</div>
+          <div class="hero-value">${true_eq:,.2f}</div>
         </div>
         <div class="hero-divider">
-          <div class="hero-label">{pnl_label}</div>
-          <div class="hero-pnl" style="color:{pnl_color};">{pnl_sign}${abs(pnl_usd):,.2f}</div>
-          <div class="hero-pnl-pct" style="color:{pnl_color};">{pnl_sign}{abs(pnl_pct):.2f}%</div>
+          <div class="hero-label">True {true_label}</div>
+          <div class="hero-pnl" style="color:{true_pnl_color};">{true_pnl_sign}${abs(true_pnl):,.2f}</div>
+          <div class="hero-pnl-pct" style="color:{true_pnl_color};">{true_pnl_sign}{abs(true_pnl_pct):.2f}%</div>
         </div>
       </div>
+      {inflation_note}
     </div>
     """,
     unsafe_allow_html=True,
@@ -588,24 +626,26 @@ if not holdings:
 else:
     rows = []
     for sym, info in holdings.items():
-        units = float(info.get("units", 0))
+        units_bought = float(info.get("units_bought", info.get("units", 0)))
         entry = float(info.get("entry_price", 0))
+        cost_basis = float(info.get("cost_basis", units_bought * entry))
         try:
             current = float(fetch_ticker(sym)["last"])
         except Exception:
             current = entry
-        value = units * current
+        true_value = units_bought * current
         pnl_pct_coin = (current / entry - 1) * 100 if entry > 0 else 0
-        pnl_usd_coin = value - units * entry
+        pnl_usd_coin = true_value - cost_basis
         rows.append({
             "Symbol": sym.replace("/USDT", ""),
-            "Units": units,
+            "Units bought": units_bought,
+            "Cost": cost_basis,
             "Entry": entry,
             "Current": current,
             "P&L %": pnl_pct_coin,
             "P&L $": pnl_usd_coin,
-            "Value": value,
-            "Weight": value / equity * 100 if equity > 0 else 0,
+            "Value": true_value,
+            "Weight": true_value / true_eq * 100 if true_eq > 0 else 0,
         })
     df = pd.DataFrame(rows).sort_values("Value", ascending=False)
     pnl_min = float(df["P&L %"].min()) - 5
@@ -615,7 +655,10 @@ else:
         df,
         column_config={
             "Symbol": st.column_config.TextColumn(width="small"),
-            "Units": st.column_config.NumberColumn(format="%.4f"),
+            "Units bought": st.column_config.NumberColumn("Units", format="%.4f",
+                help="Original units the bot bought (excludes any testnet seed)"),
+            "Cost": st.column_config.NumberColumn(format="$%,.2f",
+                help="USDT spent buying this position"),
             "Entry": st.column_config.NumberColumn(format="$%.4f"),
             "Current": st.column_config.NumberColumn(format="$%.4f"),
             "P&L %": st.column_config.ProgressColumn(
@@ -623,7 +666,8 @@ else:
                 min_value=pnl_min, max_value=pnl_max,
             ),
             "P&L $": st.column_config.NumberColumn(format="$%+,.2f"),
-            "Value": st.column_config.NumberColumn(format="$%,.2f"),
+            "Value": st.column_config.NumberColumn("True value", format="$%,.2f",
+                help="Units bought × current price (excludes testnet seed)"),
             "Weight": st.column_config.ProgressColumn(
                 "Weight", format="%.1f%%",
                 min_value=0, max_value=100,

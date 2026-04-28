@@ -278,8 +278,11 @@ def rebalance(data_exchange: ccxt.Exchange, trade_exchange: ccxt.Exchange,
                 continue
             if args.dry_run:
                 log.info(f"  [dry-run] would BUY {sym} for ${cash_per_pick:.2f}")
+                est_units = cash_per_pick / float(p["last_price"])
                 holdings[sym] = {
-                    "units": cash_per_pick / float(p["last_price"]),
+                    "units": est_units,
+                    "units_bought": est_units,
+                    "cost_basis": cash_per_pick,
                     "entry_price": float(p["last_price"]),
                     "entered_at": datetime.now(timezone.utc).isoformat(),
                 }
@@ -288,8 +291,12 @@ def rebalance(data_exchange: ccxt.Exchange, trade_exchange: ccxt.Exchange,
                 if order is not None:
                     units = float(order.get("amount") or 0)
                     avg = float(order.get("average") or p["last_price"])
+                    cost = float(order.get("cost") or cash_per_pick)
                     holdings[sym] = {
-                        "units": units, "entry_price": avg,
+                        "units": units,
+                        "units_bought": units,    # original — never modified by reconcile
+                        "cost_basis": cost,        # USDT spent — used for "true" P&L
+                        "entry_price": avg,
                         "entered_at": datetime.now(timezone.utc).isoformat(),
                     }
 

@@ -82,11 +82,32 @@ across the room:
 | Column | What it shows |
 |---|---|
 | **You put in** | Your starting cash. Set in the sidebar (`Money you put in`). Persists across restarts in `data/dashboard_config.json`. |
-| **Current value** | Live equity = USDT cash + (units × current price) for each holding. Refreshes with each cache cycle (15s by default). |
-| **Profit / Loss** | The big number. `Current value − You put in`. Shown in **dollars** and **percent**. Green if positive, red if negative. |
+| **Strategy value** | "True" equity = USDT cash + sum of `units_bought × current price` for each holding. Uses what the bot actually purchased, **not** what's currently on the exchange. |
+| **True Profit / Loss** | The big number. `Strategy value − You put in`. Shown in **dollars** and **percent**. Green if positive, red if negative. |
 
-The PnL number is what most traders mentally anchor to. Everything else on
-the dashboard exists to put that number in context.
+### Why "True" P&L (vs "Reported" P&L)
+
+The Binance Spot Testnet seeds every account with thousands of free units
+of dozens of altcoins (a "starter pack"). When the bot buys ZBT, it gets
+added on top of whatever the testnet pre-credited. The exchange's view of
+your balance is `bot-bought + testnet-seeded`, but only the bot-bought
+portion reflects strategy performance.
+
+The hero card's headline number ignores the seed and shows what the
+strategy actually did — which is what you'd see on real Binance, where no
+seed coins exist.
+
+If there's meaningful seed inflation (>$50 difference), a small note
+appears below the hero showing the testnet account total alongside the
+true number, e.g.:
+
+> ⚠ Testnet account total: **$13,612.13** (inflated by **$4,794.94** of
+> free testnet seed coins). The number above is what the strategy actually
+> did — what you'd see on real Binance.
+
+When you eventually flip `BINANCE_LIVE=true`, this note disappears
+automatically (the inflation goes to ~$0 on real Binance) and the hero
+just shows your real performance.
 
 ---
 
@@ -187,13 +208,14 @@ Every position the bot is currently managing, sorted by value (largest first):
 | Column | Meaning |
 |---|---|
 | **Symbol** | The coin (without `/USDT` suffix) |
-| **Units** | How many of that coin you own |
-| **Entry** | Price per unit when the bot bought (or last reconciled to) |
+| **Units** | How many units the bot **actually bought** (`units_bought`, ignores testnet seed) |
+| **Cost** | USDT spent buying this position (cost basis) |
+| **Entry** | Price per unit when the bot bought |
 | **Current** | Live mid price right now |
 | **P&L %** | `(Current − Entry) / Entry × 100` — shown as a colored progress bar |
-| **P&L $** | Same, in dollars |
-| **Value** | `Units × Current` — what the position is worth right now |
-| **Weight** | Position's share of total equity, shown as a progress bar |
+| **P&L $** | Dollar P&L computed from `(Current × units_bought) − Cost` — the **true** dollar gain/loss |
+| **True value** | `units_bought × Current` — what the bot's actual purchases are worth (excludes testnet seed) |
+| **Weight** | Position's share of true equity, shown as a progress bar |
 
 ### Reading the P&L bars
 
@@ -202,19 +224,19 @@ the table. The bar's full width is the range from the worst to the best
 position. So even a coin that's slightly negative might show a partly-full
 bar if the worst position is much more negative.
 
-### When entry price looks weird
+### Reading per-coin P&L correctly
 
-After the self-healing reconciliation (which can fire on every rebalance),
-the **units** column gets updated to reality but the **entry price** stays
-at what the bot originally paid. This means:
+The table now uses `units_bought` (what the bot actually purchased) rather
+than the reconciled exchange balance. So:
 
-- If the bot inherited testnet seed coins, `units` is high but `entry` is
-  low → P&L % looks great (the seed cost us nothing)
-- If the bot's last rebalance bought a fresh batch, `entry` is the recent
-  price → P&L % reflects only the move since then
+- **P&L %** is `(current_price / entry_price − 1) × 100` — pure price
+  performance since the bot bought
+- **P&L $** is `units_bought × (current − entry)` — what the strategy
+  actually earned/lost on this position
+- **True value** is `units_bought × current` — what the strategy's
+  purchases are worth (testnet seed excluded)
 
-This is by design. P&L % per coin is mostly informational; the real
-performance number is the **hero card's total P&L**.
+This is the same picture you'd see on real Binance.
 
 ---
 
