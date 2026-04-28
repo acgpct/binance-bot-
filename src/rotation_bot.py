@@ -121,6 +121,47 @@ def equity_usdt(exchange: ccxt.Exchange, holdings: dict, quote: str = "USDT") ->
     return cash, cash + pos_value
 
 
+def reconcile_state_with_exchange(exchange: ccxt.Exchange, state: dict) -> dict:
+    """Sync state's tracked unit counts with what's actually on the exchange.
+
+    Why this matters:
+      * Testnet quirks (capped fills, seeded balances) cause state to drift from reality
+      * Bot restarts can miss positions opened by a previous run on the same account
+      * Partial fills, rounding, and dust accumulate over time
+
+    Behaviour for each symbol already in state:
+      * actual > 0          → set state.units = actual (use the truth)
+      * actual == 0         → drop the symbol from state (we've effectively sold it elsewhere)
+
+    Does NOT auto-adopt symbols that aren't in state — we only manage what we
+    explicitly bought. This avoids the bot trying to manage random testnet seed
+    coins or pre-existing balances the user wants to keep separate.
+    """
+    holdings = state.get("holdings", {})
+    if not holdings:
+        return state
+
+    bal = exchange.fetch_balance()
+    cleaned = {}
+    changed = []
+    for sym, info in holdings.items():
+        base = sym.split("/")[0]
+        actual = float(bal.get(base, {}).get("free", 0))
+        old_units = float(info.get("units", 0))
+        if actual <= 0:
+            changed.append(f"{sym} dropped (actual=0)")
+            continue
+        if abs(actual - old_units) > old_units * 0.001:
+            changed.append(f"{sym}: {old_units:.4f} → {actual:.4f}")
+        info["units"] = actual
+        cleaned[sym] = info
+
+    state["holdings"] = cleaned
+    if changed:
+        log.info(f"Reconciled state with exchange: {'; '.join(changed)}")
+    return state
+
+
 def log_equity_snapshot(exchange: ccxt.Exchange, holdings: dict, cash: float,
                         equity: float, btc_price: float | None = None) -> None:
     """Append a row to the equity history CSV (for the dashboard)."""
@@ -171,6 +212,11 @@ def rebalance(data_exchange: ccxt.Exchange, trade_exchange: ccxt.Exchange,
     log.info("=" * 70)
     log.info(f"REBALANCE CYCLE — mode={'LIVE' if is_live() else 'TESTNET'} "
              f"dry_run={args.dry_run}")
+
+    # Self-heal state before any decisions: trust the exchange, not the local file.
+    reconcile_state_with_exchange(trade_exchange, state)
+    if not args.dry_run:
+        save_state(state)
 
     picks = pick_targets(data_exchange, trade_exchange,
                          universe_size=args.universe, timeframe=args.timeframe,
