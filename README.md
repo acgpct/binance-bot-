@@ -1,61 +1,377 @@
 # 🤖 Binance Rotational Momentum Bot
 
-A systematic crypto trading bot that scans Binance Spot, ranks USDT pairs by
-momentum each day, and rotates capital into the top 5. Includes a live
-Streamlit dashboard, multi-coin scanner, and a comprehensive backtesting suite.
+A systematic crypto trading bot for Binance Spot. Every 24 hours it scans the
+top 25 USDT pairs by volume, ranks them by momentum, and rotates capital into
+the top 5. Runs unattended on a $4/month VPS with a local Streamlit dashboard.
 
-> **⚠️ Risk warning.** Crypto trading is extremely risky. The strategy in this
-> repo has historically experienced **drawdowns of 50–65%** in backtests, and
-> backtests overstate live performance. Run on Binance testnet first — for at
-> least a month — and only trade real money you can afford to lose entirely.
-> This is a personal research project, not financial advice.
+> **⚠️ Risk warning.** Crypto trading is extremely risky. Backtests of this
+> strategy show drawdowns of 50–65%, and backtests overstate real performance.
+> Run on Binance testnet for at least a month before considering live money.
+> Personal research project, not financial advice.
 
 ---
 
-## What it does
+## Table of contents
+
+- [The strategy in plain English](#the-strategy-in-plain-english)
+- [Architecture overview](#architecture-overview)
+- [How the strategy actually works](#how-the-strategy-actually-works)
+- [The bot's lifecycle](#the-bots-lifecycle)
+- [The dashboard](#the-dashboard)
+- [State management & self-healing](#state-management--self-healing)
+- [Backtesting suite](#backtesting-suite)
+- [Quick start (local Mac)](#quick-start-local-mac)
+- [Deploying to a VPS](#deploying-to-a-vps)
+- [Operations & monitoring](#operations--monitoring)
+- [Failure modes the bot handles](#failure-modes-the-bot-handles)
+- [Configuration knobs](#configuration-knobs)
+- [Going live (eventually)](#going-live-eventually)
+- [Roadmap](#roadmap)
+- [Safety rules](#safety-rules)
+
+---
+
+## The strategy in plain English
 
 Imagine you can bet on 25 horses but only pick 5 at a time. Every 24 hours:
 
-1. Look at the **top 25 USDT pairs on Binance** by 24h volume
-2. Score each by **momentum** (% return over the last ~10 days) and **trend health** (price above 50-period EMA, short EMA above long EMA)
+1. Look at the **top 25 USDT pairs on Binance** by 24-hour volume
+2. Score each by **momentum** (% price return over the last ~10 days) and
+   **trend health** (price above its 50-period EMA, short EMA above long EMA)
 3. Hold the **top 5** by momentum, equal-weighted
-4. **Rotate** out of any holding that fell out of the top 5; buy any new entrants
+4. **Rotate** out of any holding that fell out of the top 5; buy any new
+   entrants
 
-That's the whole strategy. The premise: in crypto, when something starts running, it often keeps running for weeks. Catching even one such run pays for many losing trades. The strategy accepts ugly weeks (and the occasional brutal month) in exchange for the asymmetric upside of capturing those runs.
-
----
-
-## Architecture
-
-```
-src/
-├── exchange.py            # Binance connection — testnet for trading, public mainnet for data
-├── data.py                # OHLCV fetching + parquet cache
-├── scanner.py             # rank top USDT pairs by momentum + trend filter
-├── strategy.py            # legacy single-coin EMA crossover (with HTF filter + SL/TP)
-├── backtest.py            # backtest the EMA strategy
-├── rotation_backtest.py   # backtest the rotational momentum strategy
-├── rotation_bot.py        # LIVE rotational bot (testnet by default)
-├── bot.py                 # legacy single-coin EMA bot
-└── stress_test.py         # parameter robustness + walk-forward + fee sensitivity tests
-dashboard/
-└── app.py                 # Streamlit dashboard with live P&L, equity curve, scanner picks
-notebooks/
-└── explore.ipynb          # interactive research
-data/                      # cached OHLCV + runtime state (gitignored)
-```
-
-The two-exchange split is deliberate: **mainnet (public)** is used for scanning
-and historical data (testnet only retains ~25 days of 5m candles), while
-**testnet (authenticated)** is used for actual order execution. The bot reads
-"what's pumping in the real world" but executes against fake money until you
-flip `BINANCE_LIVE=true`.
+That's it. The premise: in crypto, when something starts running it tends to
+keep running for weeks. Catching even one such run pays for many losing
+trades. The strategy accepts ugly weeks (and the occasional brutal month) in
+exchange for the asymmetric upside of capturing those runs.
 
 ---
 
-## Quick start
+## Architecture overview
 
-### 1. Clone and install
+```
+                                 ┌──────────────────────────────────┐
+                                 │      Binance Spot Mainnet        │
+                                 │  (public API, no auth needed)    │
+                                 └─────────────┬────────────────────┘
+                                               │
+                                               │ universe + OHLCV (scanning)
+                                               │
+   ┌──────────────────────────────────┐        │
+   │      Binance Spot Testnet        │        │
+   │  (authenticated trading account) │◀───────┼─── orders + balances
+   └────────────────┬─────────────────┘        │
+                    │                          │
+                    │   ┌──────────────────────┴───────────────────┐
+                    │   │              VPS (DigitalOcean)          │
+                    │   │  ┌─────────────────────────────────────┐ │
+                    │   │  │  rotation_bot.py (systemd service)  │ │
+                    │   │  │  • scanner.py (mainnet)             │ │
+                    │   └──┤  • exchange.py (testnet for trades) │ │
+                    │      │  • strategy: top-5 by momentum      │ │
+                    │      │  • state: data/rotation_state.json  │ │
+                    │      │  • equity: data/equity_history.csv  │ │
+                    │      └─────────────────────────────────────┘ │
+                    │                                              │
+                    │      ┌──────────────────────────────────────┐│
+                    │      │  systemd auto-restart, journald logs ││
+                    │      └──────────────────────────────────────┘│
+                    │                                              │
+                    │       scp pulls state.json + equity.csv      │
+                    └─────────▶ ┌──────────────────────────────────┴┐
+                                │           Local Mac               │
+                                │  ┌──────────────────────────────┐ │
+                                │  │  Streamlit dashboard         │ │
+                                │  │  (dashboard/app.py)          │ │
+                                │  │  • reads state from sync     │ │
+                                │  │  • queries testnet directly  │ │
+                                │  │    for current prices/bal    │ │
+                                │  └──────────────────────────────┘ │
+                                └───────────────────────────────────┘
+```
+
+**Two exchanges, deliberately.** The bot uses two `ccxt.binance` clients:
+
+- **`get_data_exchange()`** — public mainnet, no auth. Used for scanning the
+  universe and fetching historical OHLCV. The testnet only retains ~25 days
+  of intraday data and a small subset of pairs, so backtesting and scanning
+  must use real market data.
+- **`get_exchange()`** — authenticated client; testnet by default,
+  flips to mainnet when `BINANCE_LIVE=true`. Used only for placing orders
+  and reading account balances.
+
+The bot reads "what's pumping in the real world" but executes against fake
+money until you flip the env var.
+
+---
+
+## How the strategy actually works
+
+### Step 1: build the universe
+
+`scanner.get_universe()` calls Binance mainnet's `fetchTickers`, filters to
+`*/USDT` pairs, removes:
+- Stablecoins (USDC, FDUSD, TUSD, BUSD, DAI, USDP, EUR, GBP, etc.)
+- Leveraged tokens (anything ending in UP/DOWN/BULL/BEAR)
+- Pairs with 24h quote volume below the threshold (default $5M)
+
+Sorts by 24h quote volume descending, takes the top N (default 25).
+
+### Step 2: score each coin
+
+For each coin in the universe, fetch ~14 days of 4h candles from mainnet and
+compute (`scanner.score()`):
+
+```
+ema_short  = EMA(close, 20)
+ema_long   = EMA(close, 50)
+ATR%       = mean(true_range, 14) / close × 100        # volatility proxy
+
+in_uptrend       = (close > ema_long) AND (ema_short > ema_long)
+above_long_pct   = (close / ema_long - 1) × 100
+momentum_pct     = (close / close[-momentum_lookback] - 1) × 100
+```
+
+Where `momentum_lookback` defaults to 60 bars (≈ 10 days on 4h).
+
+**Filter**: only coins with `in_uptrend == True` are eligible.
+**Rank**: sort eligible coins by `momentum_pct` descending.
+
+### Step 3: pick top K
+
+`rotation_bot.pick_targets()` takes the top K (default 5) and intersects them
+with what's tradeable on the configured exchange (testnet supports ~2,180
+USDT pairs out of the ~500 mainnet ones we'd consider — most overlap, but a
+handful don't). Picks not tradeable on the configured exchange are skipped.
+
+### Step 4: rebalance
+
+For every coin in the new picks list:
+
+- Already held & still in picks → keep, no action
+- Held & no longer in picks → SELL (market order)
+- New pick & not held → BUY (market order, allocate equal share of free cash)
+
+Every 24h, repeat.
+
+---
+
+## The bot's lifecycle
+
+`python -m src.rotation_bot` runs an infinite loop. Each iteration is one
+**rebalance cycle**:
+
+```
+START
+  │
+  ├── Connect to mainnet (data) and testnet/live (trading)
+  ├── Load state from data/rotation_state.json
+  └── Log mode (TESTNET / LIVE)
+  │
+  ▼
+LOOP {
+  │
+  ├── reconcile_state_with_exchange()    [SELF-HEAL]
+  │     For each tracked symbol:
+  │       actual = exchange.fetch_balance()[base].free
+  │       if actual <= 0: drop from state
+  │       else: state.units = actual
+  │
+  ├── pick_targets()
+  │     Universe scan → score → rank → top K → filter to tradeable
+  │
+  ├── For each holding NOT in picks:
+  │     market_sell(symbol, units)        [uses min(state, actual)]
+  │
+  ├── For each pick NOT yet held:
+  │     market_buy_quote(symbol, cash_per_pick)
+  │
+  ├── log_equity_snapshot()
+  │     Append { timestamp, equity, cash, btc_price, holdings } to
+  │     data/equity_history.csv
+  │
+  ├── save_state(state)
+  │     Persist updated holdings + last_rebalance to JSON
+  │
+  └── time.sleep(86400)  ≈ 24h on a 4h timeframe with 6-bar interval
+}
+```
+
+**Failure handling**: the outer try/except catches all exceptions, logs the
+traceback, and sleeps 60s before retrying. SIGTERM / Ctrl+C is caught
+cleanly and the loop exits without leaving the state in a half-written
+state.
+
+**Restart safety**: if the process dies and restarts (systemd's
+`Restart=on-failure`), the state file is loaded from disk and the bot
+resumes where it left off. The reconcile step at the start of every cycle
+ensures the in-memory state matches what's actually on the exchange.
+
+---
+
+## The dashboard
+
+`dashboard/app.py` (Streamlit) shows:
+
+| Section | What it shows | Where the data comes from |
+|---|---|---|
+| **Topbar** | Mode (testnet/live), bot status pill, last rebalance time | `data/rotation_state.json` + clock |
+| **Hero card** | Money put in, current value, profit/loss in $ and % | starting cash (sidebar) + live exchange balance |
+| **Secondary tiles** | vs BTC HODL %, cash USDT, position count, BTC price | `equity_history.csv` (start point) + live ticker |
+| **Equity chart** | Strategy equity over time + BTC HODL benchmark | `equity_history.csv` (snapshots) |
+| **Portfolio donut** | Allocation % across positions + cash | live ticker × `state.units` |
+| **Holdings table** | Per-coin entry/current/P&L%/P&L$/value/weight | state + live ticker |
+| **Live scanner** | What the bot would pick *right now* | mainnet API (fresh scan, ~10s) |
+| **Recent rebalances** | Last 20 rebalance snapshots | `equity_history.csv` |
+
+### Where the dashboard runs
+
+The dashboard runs **on your Mac** (or wherever you want), not on the VPS.
+Two reasons:
+
+1. **You don't want to expose Streamlit publicly** (it has no auth)
+2. **The dashboard mostly queries Binance directly** (current balance, prices,
+   tickers), so it works the same regardless of where the bot lives
+
+The two state files (`rotation_state.json`, `equity_history.csv`) are the
+exception — they're written by the bot, read by the dashboard. When the bot
+runs on a VPS, you sync them to your Mac with:
+
+```bash
+bash deploy/sync_from_vps.sh <VPS-IP>
+```
+
+This `scp`s the two files down. Run before opening the dashboard for fresh
+data.
+
+---
+
+## State management & self-healing
+
+The bot persists two things:
+
+### `data/rotation_state.json`
+
+```json
+{
+  "holdings": {
+    "ZBT/USDT": {
+      "units": 17044.6,
+      "entry_price": 0.21744,
+      "entered_at": "2026-04-28T10:08:50+00:00"
+    },
+    "ORCA/USDT": { ... }
+  },
+  "last_rebalance": "2026-04-28T10:08:50+00:00"
+}
+```
+
+What it tracks: which symbols the bot is currently managing, how many units
+of each, the price the bot bought at, and when the last rebalance happened.
+
+### `data/equity_history.csv`
+
+```csv
+timestamp,equity,cash,btc_price,n_positions,holdings
+2026-04-27T06:22:37+00:00,9297.65,19.34,77859.56,5,ORCA/USDT|ZBT/USDT|D/USDT|LUNC/USDT|PENGU/USDT
+2026-04-28T10:08:50+00:00,8782.96,226.19,78145.20,5,ORCA/USDT|ZBT/USDT|LUNC/USDT|PENGU/USDT|APE/USDT
+```
+
+What it tracks: a snapshot of equity, cash, BTC price, and held symbols at
+each rebalance. Used by the dashboard for the equity chart and the BTC HODL
+benchmark.
+
+### Self-healing reconciliation
+
+A class of bugs we hit early on: **state file drifts from reality**. Causes:
+
+- Testnet quirks: a buy of 132,401 D was capped at the testnet's seed
+  balance of 18,446
+- Partial fills on illiquid pairs
+- The bot restarting on a different machine inheriting an empty state file
+  while the exchange account already had positions
+- Fee deductions or rounding
+
+To prevent any of these from corrupting the bot's behaviour,
+`reconcile_state_with_exchange()` runs at the **start of every rebalance**:
+
+```python
+for sym in state['holdings']:
+    actual_free = exchange.fetch_balance()[sym.base].free
+    if actual_free <= 0:
+        drop the symbol from state
+    else:
+        state[sym].units = actual_free   # trust the exchange
+```
+
+After this, the bot's view always matches reality. The defensive
+`market_sell()` also caps the sell quantity at `min(state.units,
+actual_free)` as a second line of defence.
+
+**What it does NOT do**: auto-adopt symbols that aren't already in state.
+The bot only manages what it has explicitly bought. This keeps it from
+trying to "manage" the testnet's seeded balances of 200+ random altcoins.
+
+---
+
+## Backtesting suite
+
+Three backtest scripts, in increasing order of intellectual honesty:
+
+| Script | What it tests | Honesty level |
+|---|---|---|
+| `python -m src.backtest` | Single-coin EMA crossover (legacy) | Naive |
+| `python -m src.rotation_backtest` | Top-K rotation, fixed universe | Naive (survivorship-biased) |
+| `python -m src.rotation_backtest --bias-aware` | Top-K rotation, point-in-time universe | Honest |
+| `python -m src.stress_test` | Robustness sweep + walk-forward + fee sensitivity | Honest |
+
+### Naive vs bias-aware
+
+The naive backtest uses *today's* top-25 USDT pairs as the universe across
+the entire historical period — silently selecting coins that turned out to
+be popular, dramatically inflating returns.
+
+The bias-aware backtest fixes this: at each rebalance, it ranks coins by
+*trailing 30-day USD volume at that point in time* from a 100-coin
+candidate pool, mimicking what a live scanner would have actually seen.
+
+| Configuration | 1y return | Max DD | What it tests |
+|---|---|---|---|
+| **A. Biased** — fixed top-25 (legacy) | **+145%** | -55% | Inflated by hindsight |
+| **B. Bias-aware** — dynamic top-25 of 100 | **−86%** | -90% | Tight universe, no hindsight |
+| **C. Bias-aware** — dynamic top-50 of 100 | -71% | -89% | — |
+| **E. Bias-aware** — dynamic top-5 of 100 | **+96%** | -68% | Broad scan, point-in-time |
+| BTC buy-and-hold (benchmark) | -17% | — | — |
+
+Realistic real-world expectation: somewhere between **−50% and +50% per
+year** with **50–70% drawdowns** the norm. The strategy probably has a
+small real edge over BTC, but not the +200% the naive backtest implied.
+
+Run the comparison yourself:
+
+```bash
+python -m src.rotation_backtest --top 25 --days 365                                    # naive
+python -m src.rotation_backtest --bias-aware --candidate-pool 100 --universe-size 25 --days 365   # honest
+```
+
+### Stress test
+
+`python -m src.stress_test` runs three tests on 1y of 4h data:
+
+1. **Robustness sweep** — 60 configurations of (top_k, momentum_lookback,
+   rebalance frequency) to see if good results are clustered (real edge) or
+   isolated (overfit)
+2. **Walk-forward** — runs the best config on 10 overlapping 90-day windows;
+   reports the distribution of returns and worst-window
+3. **Fee sensitivity** — same config at fees of 0.05% / 0.1% / 0.2% / 0.5%
+
+---
+
+## Quick start (local Mac)
+
+### Install
 
 ```bash
 git clone https://github.com/acgpct/binance-bot-.git
@@ -65,116 +381,141 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Get testnet API keys
+### Get testnet API keys
 
-1. Go to https://testnet.binance.vision/
-2. Log in with GitHub
-3. Click **Generate HMAC_SHA256 Key** — save the API Key and Secret Key
-4. Copy `.env.example` to `.env` and paste the keys
+1. Visit https://testnet.binance.vision/ → log in with GitHub
+2. Click **Generate HMAC_SHA256 Key** → save both keys
+3. Copy `.env.example` to `.env` and paste them in
 
 ```bash
 cp .env.example .env
-# Edit .env, paste your keys
+# edit .env, paste your testnet keys
 ```
 
-### 3. Run the bot
+### First run
 
 ```bash
-# One rebalance cycle, no orders (sanity check)
+# Sanity check — what would the bot pick? (no orders)
 python -m src.rotation_bot --show-picks
 
-# Run continuously on testnet (recommended for first 30 days)
+# Dry-run a full cycle — log everything but place no orders
+python -m src.rotation_bot --dry-run --once
+
+# Run continuously (Ctrl+C to stop)
 caffeinate -i python -m src.rotation_bot
 ```
 
-### 4. Open the dashboard
+`caffeinate -i` stops macOS from sleeping the bot when you close the lid.
+The bot rebalances every 24h.
 
-In a separate terminal:
+### Open the dashboard (separate terminal)
 
 ```bash
 streamlit run dashboard/app.py
-# Opens at http://localhost:8501
+# opens at http://localhost:8501
 ```
-
-The dashboard shows current P&L (big number, hard to miss), equity curve vs
-BTC HODL benchmark, per-coin holdings, and what the scanner would pick right
-now.
 
 ---
 
-## Backtests
+## Deploying to a VPS
 
-The project ships with three backtest scripts:
+The bot needs to run continuously, which means either:
+- Your Mac is always awake and plugged in, or
+- It runs on a server somewhere
 
-| Script | What it does |
-|---|---|
-| `python -m src.backtest` | Single-coin EMA crossover backtest |
-| `python -m src.rotation_backtest` | Rotational momentum portfolio backtest |
-| `python -m src.stress_test` | Robustness sweep + walk-forward + fee sensitivity |
+For the second, see the dedicated deployment guide:
 
-### Backtest results: biased vs bias-aware (1y of 4h data)
+👉 **[`deploy/DEPLOY.md`](deploy/DEPLOY.md)** — step-by-step DigitalOcean / Hetzner setup
 
-The naive backtest uses *today's* top-25 USDT pairs as the universe across the
-entire historical period — which **silently selects coins that turned out to
-be popular**, dramatically inflating returns. This repo includes a
-`--bias-aware` flag that fixes this: at each rebalance, it ranks coins by
-their *trailing 30-day USD volume at that point in time* from a 100-coin
-candidate pool, mimicking what a live scanner would have actually seen.
+End-to-end: ~15 minutes. Cost: $4–6/month. The repo includes:
 
-| Configuration | 1y return | Max DD | What it tests |
-|---|---|---|---|
-| **A. Biased** — fixed top-25 (legacy) | **+145%** | -55% | Inflated by hindsight |
-| **B. Bias-aware** — dynamic top-25 of 100 | **−86%** | -90% | Tight universe with no hindsight |
-| **C. Bias-aware** — dynamic top-50 of 100 | -71% | -89% | — |
-| **E. Bias-aware** — dynamic top-5 of 100 | **+96%** | -68% | Broad scan, point-in-time |
-| BTC buy-and-hold | -17% | — | Benchmark |
+- `deploy/setup.sh` — one-shot Ubuntu 24.04 provisioning script
+- `deploy/binance-bot.service` — `systemd` service definition with
+  auto-restart, journald logging, and basic process hardening
+- `deploy/sync_from_vps.sh` — pulls the bot's state files down to your Mac
+  so the dashboard shows live data
 
-**Reading the table honestly:**
+---
 
-- The biased +145% **vanishes** when you use a tight bias-aware universe (B/C/D)
-- The strategy **only works** when scanning a wide candidate pool (E: top-5 of 100, +96%)
-- This is consistent with how the live bot operates (it scans top-25 from *all* current Binance pairs, not a fixed list)
-- Realistic real-world expectation: **somewhere between -50% and +50% per year**, with **50–70% drawdowns** the norm
+## Operations & monitoring
 
-The takeaway: **the strategy probably has a small real edge over buy-and-hold,
-but not the eye-popping numbers from the naive backtest.** Anyone showing you
-a crypto strategy with +200%+ backtest returns and not discussing universe
-construction is either ignorant or selling something. Be skeptical.
+### Bot status (on VPS)
 
-Run the comparison yourself:
 ```bash
-# Naive (biased)
-python -m src.rotation_backtest --top 25 --days 365
+ssh root@<VPS-IP>
+systemctl status binance-bot                         # is it running?
+journalctl -u binance-bot -f                         # live logs
+journalctl -u binance-bot -n 100 --no-pager          # last 100 lines
+journalctl -u binance-bot --since "1 hour ago"       # last hour
+```
 
-# Bias-aware
-python -m src.rotation_backtest --bias-aware --candidate-pool 100 --universe-size 25 --days 365
+### Sync state to your Mac dashboard
+
+```bash
+# In the project directory on your Mac
+bash deploy/sync_from_vps.sh <VPS-IP>
+# Then refresh the dashboard tab
+```
+
+### Update the bot after a code change
+
+```bash
+ssh root@<VPS-IP>
+sudo -u botuser git -C /home/botuser/binance-bot- pull
+sudo -u botuser /home/botuser/binance-bot-/.venv/bin/pip install -q -r /home/botuser/binance-bot-/requirements.txt
+systemctl restart binance-bot
+journalctl -u binance-bot -f         # verify it came back up
+```
+
+### Stop the bot
+
+```bash
+systemctl stop binance-bot           # holds the service stopped
+systemctl disable binance-bot        # also disables auto-start on reboot
 ```
 
 ---
 
-## Honest performance discussion
+## Failure modes the bot handles
 
-Two days of testnet running (April 2026) produced this sequence:
+| Failure | What happens | How the bot recovers |
+|---|---|---|
+| **Network hiccup** | API call raises | Outer try/except logs and retries after 60s |
+| **macOS lid closes** | Process pauses | `caffeinate -i` keeps the system awake while the bot runs |
+| **VPS reboots** | systemd starts the service automatically | State persists, bot resumes |
+| **Bot crashes** | systemd's `Restart=on-failure` kicks in (max 5 in 5min) | State persists, bot resumes |
+| **Sell fails (insufficient balance)** | `market_sell()` queries actual balance and caps to `min(state, actual)` | Sells what we actually have, drops the symbol from state |
+| **Buy fails (min notional)** | Skips the buy, logs a warning | Tries again next cycle |
+| **State drifts from exchange (testnet quirk)** | `reconcile_state_with_exchange()` at the start of every cycle | Updates state to match exchange; logs the diff |
+| **Symbol not on testnet** | Filtered out at `pick_targets()` | Picks the next-best tradeable coin |
+| **No coins pass trend filter** | Logs a warning, skips rebalance | Tries again next cycle |
+| **Two bots on same testnet account** | Race conditions, fighting over orders | Don't do this — kill one before starting the other |
 
-- Day 1 (deploy): bought 5 coins at top of their pumps
-- Day 2 morning: -10% (ORCA dropped 29% from entry)
-- Day 2 evening: rebalanced, dropped some losers
-- Day 3 morning: +1.8% (ZBT pumped 27%, LUNC 15%)
+### Notes on Binance Spot Testnet quirks
 
-This is **textbook behavior** for a momentum strategy: nausea on the daily
-chart, healthy upward drift on the weekly chart. If you can't watch -10% days
-without panicking, **reduce position size or use a different strategy**.
+The testnet is useful but has weird behaviours that don't exist on real
+Binance:
+
+- **Many altcoins are pre-seeded** with ~16,000–18,000 free units each. Buy
+  orders add on top of these, inflating equity calculations.
+- **Some coins have caps** — e.g., a buy of 132,401 D got truncated to
+  ~18,446. State and reality diverge until reconciled.
+- **Liquidity is thin** — fills can be slow or partial.
+- **Symbol set differs** from mainnet — most overlap, a few don't.
+
+The reconciliation logic + defensive sell handle all of these gracefully.
+On real Binance, none of these quirks apply.
 
 ---
 
 ## Configuration knobs
 
-The bot has sensible defaults from the stress test (best risk-adjusted config),
-but everything is tunable:
+Sensible defaults are baked in (best risk-adjusted config from the stress
+test), but everything is tunable:
 
 ```bash
 python -m src.rotation_bot \
-  --top-k 5 \              # number of coins to hold
+  --top-k 5 \              # number of coins to hold at once
   --universe 25 \          # universe size (top N USDT pairs by volume)
   --timeframe 4h \         # bar size for momentum scoring
   --momentum-lookback 60 \ # bars used for momentum % return (60 × 4h ≈ 10 days)
@@ -187,48 +528,50 @@ Other useful flags:
 - `--show-picks` — print current picks and exit
 - `--once` — run a single rebalance cycle then exit
 
-### Run it 24/7 on a VPS (so you can close your laptop)
+### Environment variables (.env)
 
-When you're ready to stop running it on your Mac, the repo includes a
-turnkey deployment to a $4/month Linux server. See
-[`deploy/DEPLOY.md`](deploy/DEPLOY.md) for the full walkthrough — about
-15 minutes end-to-end.
+```
+BINANCE_API_KEY=...        # testnet by default
+BINANCE_API_SECRET=...
+BINANCE_LIVE=false         # set true ONLY when ready for real funds
+```
 
-Highlights:
-- One-shot setup script (`deploy/setup.sh`) provisions a fresh Ubuntu droplet
-- `systemd` service auto-restarts on crashes and survives reboots
-- Logs via `journalctl -u binance-bot -f`
-- Your local Streamlit dashboard keeps working because it queries the
-  exchange directly, not the bot's local state
+---
 
-### Going live (eventually)
+## Going live (eventually)
 
-After **at least 30 days** of testnet running where the live results track
+After **at least 30 days** of testnet running where live results track
 backtest expectations:
 
-1. Get **real** Binance API keys (not testnet)
+1. Generate **real** Binance API keys (not testnet) — restrict to "spot
+   trading", IP-allowlist your VPS
 2. Set `BINANCE_LIVE=true` in `.env`
 3. Restart the bot
 
-You'll get a 5-second warning before any live order. The bot will be more
-careful about minimum order sizes and will refuse to deploy below ~$6 per
-position.
+The bot will print a 5-second warning before any live order. It will refuse
+to deploy below ~$6 per position (Binance min notional).
 
-**Don't go live before you can sit through a -30% drawdown without touching
-anything.** That's the actual test of whether you should run this with money.
+**Do not go live before you can sit through a -30% drawdown without
+touching anything.** That's the actual test of whether you should run this
+with real money. The testnet exists specifically to find out where your
+emotional limits are while it's still cheap.
 
 ---
 
 ## Roadmap
 
 - [x] **Fix survivorship bias in backtests** — point-in-time universe via `--bias-aware`
-- [ ] Add bull/bear regime filter (only trade when BTC is uptrending)
+- [x] **Self-healing state reconciliation** — `reconcile_state_with_exchange()`
+- [x] **Defensive sells** — `min(state, actual_balance)`
+- [x] **VPS deployment** — `deploy/setup.sh` + systemd unit
+- [x] **Sync script** — pull state from VPS to Mac for the dashboard
+- [ ] Bull/bear regime filter (only trade when BTC is uptrending)
 - [ ] Include delisted coins in candidate pool (truly bias-free backtest)
 - [ ] Multi-lookback momentum (combine 20/40/60-bar ranks for robustness)
 - [ ] Walk-forward parameter optimization
-- [ ] VPS deployment guide (systemd service)
 - [ ] Telegram/email alerts on rebalance and big drawdowns
 - [ ] SQLite for state instead of JSON
+- [ ] Web-deployed dashboard with auth (so it works from anywhere)
 
 ---
 
@@ -239,10 +582,15 @@ anything.** That's the actual test of whether you should run this with money.
 3. **The repo is private.** Keep it that way — public repos with `BINANCE_API_KEY=` patterns get scraped within minutes.
 4. **The bot only manages what it bought.** Pre-existing testnet balances are ignored, so the bot won't touch coins you put there manually.
 5. **Position state persists.** Restarting the bot mid-position picks up where it left off; deleting `data/rotation_state.json` resets the bot's view (positions on the exchange remain).
+6. **The reconcile step is non-negotiable.** If you remove it, you'll re-introduce the entire class of state-drift bugs.
+7. **VPS keys ≠ Mac keys.** Use a separate testnet API key on the VPS so you can revoke one without taking down the other.
 
 ---
 
 ## Project status
 
-Personal research project. Not maintained for production use. Use at your own
-risk. If this is useful to you, fork it. If you find a bug, open an issue.
+Personal research project. Not maintained for production use. Use at your
+own risk. If this is useful to you, fork it. If you find a bug, open an
+issue.
+
+Built in collaboration with Claude Code.

@@ -52,10 +52,16 @@ st.set_page_config(
 st.markdown(
     f"""
     <style>
-    @import url('https://rsms.me/inter/inter.css');
-    html, body, [class*="css"] {{
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    @import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700;800&family=Geist+Mono:wght@400;500&display=swap');
+    html, body, [class*="css"], .stApp {{
+        font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
         -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+    }}
+    .hero-value, .hero-pnl, .hero-pnl-pct,
+    [data-testid="stMetricValue"] {{
+        font-feature-settings: 'tnum', 'cv11';
+        font-variant-numeric: tabular-nums;
     }}
     .stApp {{ background: {BG}; }}
     .block-container {{
@@ -409,7 +415,7 @@ with k4:
 # ---------- Equity chart + portfolio donut ----------
 left, right = st.columns([2, 1])
 
-PLOT_FONT = {"color": INK, "family": "Inter, system-ui"}
+PLOT_FONT = {"color": INK, "family": "Geist, Inter, system-ui"}
 PLOT_LAYOUT = dict(
     paper_bgcolor=CARD,
     plot_bgcolor=CARD,
