@@ -43,11 +43,18 @@ def _aligned_close_panel(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return closes.sort_index().ffill()
 
 
+def _trailing_usd_volume(df: pd.DataFrame, window_bars: int) -> pd.Series:
+    """Trailing USD volume over `window_bars` (sum of base_volume × close)."""
+    return (df["volume"] * df["close"]).rolling(window_bars, min_periods=1).sum()
+
+
 def run(data: dict[str, pd.DataFrame], rebalance_bars: int = 6,
         momentum_lookback: int = 20, ema_short: int = 20, ema_long: int = 50,
         top_k: int = 1, starting_cash: float = 10_000.0,
         skip_top_n: int = 0, volatility_weighted: bool = False,
-        trailing_stop_pct: float = 0.0) -> dict:
+        trailing_stop_pct: float = 0.0,
+        universe_size: int | None = None,
+        volume_window_bars: int = 180) -> dict:
     """Rotational momentum simulation.
 
     skip_top_n           — skip the N most-pumped picks (avoids buying the very top)
@@ -55,10 +62,21 @@ def run(data: dict[str, pd.DataFrame], rebalance_bars: int = 6,
     trailing_stop_pct    — between rebalances, sell any coin that drops this % from
                            its post-entry high. The freed cash sits idle until the
                            next rebalance.
+    universe_size        — if set, dynamically pick the top-N coins by trailing USD
+                           volume at each rebalance (point-in-time universe; reduces
+                           survivorship bias). If None, all coins in `data` are
+                           eligible at every rebalance (the biased / legacy mode).
+    volume_window_bars   — bars used for trailing volume ranking (default 180 ≈ 30d on 4h).
     """
     closes = _aligned_close_panel(data)
     if len(closes) == 0:
         raise ValueError("No data to backtest.")
+
+    # Pre-compute trailing USD volume per coin (vectorised, cheaper than per-bar)
+    trailing_vol = pd.DataFrame({
+        sym: _trailing_usd_volume(df, volume_window_bars)
+        for sym, df in data.items()
+    }).reindex(closes.index).ffill()
 
     cash = starting_cash
     # holdings: sym -> {units, peak_price}
@@ -96,9 +114,21 @@ def run(data: dict[str, pd.DataFrame], rebalance_bars: int = 6,
         if (i - warmup) % rebalance_bars != 0:
             continue
 
-        # Score every coin using ONLY data available up to and including ts
+        # Determine the eligible universe at this rebalance
+        if universe_size:
+            # Bias-aware: rank by trailing USD volume AT THIS POINT IN TIME
+            vol_at_ts = trailing_vol.loc[ts].dropna()
+            vol_at_ts = vol_at_ts[vol_at_ts > 0]
+            eligible_symbols = list(vol_at_ts.nlargest(universe_size).index)
+        else:
+            eligible_symbols = list(data.keys())
+
+        # Score eligible coins using ONLY data available up to and including ts
         scores = []
-        for sym, df in data.items():
+        for sym in eligible_symbols:
+            df = data.get(sym)
+            if df is None:
+                continue
             slice_df = df.loc[:ts]
             if len(slice_df) < ema_long + 5:
                 continue
@@ -189,12 +219,21 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=1, help="Hold top K coins, equal-weighted")
     parser.add_argument("--cash", type=float, default=10_000.0)
     parser.add_argument("--min-volume", type=float, default=5_000_000)
+    parser.add_argument("--bias-aware", action="store_true",
+                        help="Use point-in-time universe (rank by trailing USD volume at "
+                             "each rebalance). Requires --candidate-pool to be larger than --universe-size.")
+    parser.add_argument("--candidate-pool", type=int, default=100,
+                        help="With --bias-aware: total candidate pool fetched from mainnet")
+    parser.add_argument("--universe-size", type=int, default=25,
+                        help="With --bias-aware: top-N by volume picked at each rebalance")
     args = parser.parse_args()
 
     ex = get_data_exchange()
-    universe = get_universe(ex, top_n=args.top, min_volume_usd=args.min_volume)
-    print(f"Universe ({len(universe)} coins): {', '.join(p['symbol'] for p in universe)}")
-    print(f"Fetching history (this may take a minute, cached after first run)...")
+    pool_size = args.candidate_pool if args.bias_aware else args.top
+    universe = get_universe(ex, top_n=pool_size, min_volume_usd=args.min_volume)
+    print(f"Candidate pool ({len(universe)} coins)" if args.bias_aware
+          else f"Universe ({len(universe)} coins): {', '.join(p['symbol'] for p in universe)}")
+    print(f"Fetching history (this may take a few minutes, cached after first run)...")
 
     data = _ensure_data(ex, universe, args.timeframe, args.days)
     print(f"Got data for {len(data)} coins")
@@ -204,6 +243,7 @@ def main() -> None:
         momentum_lookback=args.momentum_lookback,
         ema_short=args.ema_short, ema_long=args.ema_long,
         top_k=args.top_k, starting_cash=args.cash,
+        universe_size=args.universe_size if args.bias_aware else None,
     )
 
     btc = data.get("BTC/USDT")
