@@ -63,7 +63,23 @@ def usdt_value(exchange: ccxt.Exchange, symbol: str, units: float) -> float:
 
 
 def market_sell(exchange: ccxt.Exchange, symbol: str, units: float) -> dict | None:
+    """Sell `units` of `symbol` — but never more than the actual exchange balance.
+
+    Prevents 'insufficient balance' errors when our state file drifts from reality
+    (e.g. testnet quirks, partial fills, or rounding). This is the defensive
+    pattern: trust the exchange's view of your balance, not your local state.
+    """
     try:
+        base = symbol.split("/")[0]
+        actual_free = float(exchange.fetch_balance().get(base, {}).get("free", 0))
+        if actual_free <= 0:
+            log.warning(f"  SELL {symbol} skipped: no {base} on the exchange")
+            return None
+        if actual_free < units:
+            log.warning(f"  SELL {symbol}: state has {units} {base} but exchange shows "
+                        f"only {actual_free}; selling what we actually have")
+            units = actual_free
+
         units = float(exchange.amount_to_precision(symbol, units))
         market = exchange.market(symbol)
         min_amount = (market.get("limits", {}).get("amount", {}) or {}).get("min")
