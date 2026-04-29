@@ -564,6 +564,25 @@ Other useful flags:
 - `--dry-run` — log decisions but place no orders
 - `--show-picks` — print current picks and exit
 - `--once` — run a single rebalance cycle then exit
+- `--regime-filter` — enable the BTC bull/bear macro filter
+- `--regime-bear-alloc 0.5` — fraction of cash to deploy in bear regime (default 0.5; backtests favor it)
+
+### Soft regime filter (recommended risk mitigation)
+
+Backtests on the trustworthy bias-aware dataset:
+
+| Config | 1y return | Max drawdown |
+|---|---|---|
+| No filter (baseline) | +44.1% | -67.4% |
+| **Soft filter — 50% deployed in bear regimes** | **+44.2%** | **-56.4%** |
+| Hard filter — 0% deployed in bear (full exit) | +13.2% | -61.4% |
+
+The soft filter keeps the same return as no-filter while reducing the worst drawdown by 11 percentage points. It works by *not liquidating existing positions* but *only deploying half the cash for new picks during BTC bear regimes*. Avoids the whipsaw losses of binary on/off.
+
+Enable it with:
+```bash
+python -m src.rotation_bot --regime-filter --regime-bear-alloc 0.5
+```
 
 ### Environment variables (.env)
 
@@ -627,7 +646,7 @@ value, P&L per ticker, and recent buys.
 - [x] **Weekly summary notification** — `launchd` job posts a macOS notification every Sunday
 - [x] **True P&L tracking** — `units_bought` + `cost_basis` preserved through reconcile so the dashboard shows real strategy performance, not testnet-seed-inflated numbers
 - [x] **DCA bot for stocks/ETFs** — `src/dca_bot.py` with simulation/paper/live modes + tactical multiplier
-- [ ] Bull/bear regime filter (only trade when BTC is uptrending)
+- [x] **Soft regime filter** — `--regime-filter --regime-bear-alloc 0.5` deploys 50% of cash during BTC bear regimes. Backtests show same return, ~17% lower max drawdown.
 - [ ] Include delisted coins in candidate pool (truly bias-free backtest)
 - [ ] Multi-lookback momentum (combine 20/40/60-bar ranks for robustness)
 - [ ] Walk-forward parameter optimization

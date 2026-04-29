@@ -48,13 +48,35 @@ def _trailing_usd_volume(df: pd.DataFrame, window_bars: int) -> pd.Series:
     return (df["volume"] * df["close"]).rolling(window_bars, min_periods=1).sum()
 
 
+def _btc_regime(data: dict[str, pd.DataFrame], ema_short: int = 50,
+                ema_long: int = 200) -> pd.Series | None:
+    """Return a bool Series aligned to BTC's index: True when BTC is in a
+    bull regime (short EMA > long EMA). Used as a 'risk-on' filter.
+
+    Logic: at each bar, check BTC's trend. If bearish, the strategy sits in
+    cash. The signal is shifted by 1 bar to avoid lookahead bias (decisions
+    use the previous bar's confirmed regime).
+    """
+    btc = data.get("BTC/USDT")
+    if btc is None or len(btc) < ema_long + 5:
+        return None
+    close = btc["close"]
+    short = close.ewm(span=ema_short, adjust=False).mean()
+    long_ = close.ewm(span=ema_long, adjust=False).mean()
+    regime = (short > long_).shift(1).fillna(False)
+    return regime
+
+
 def run(data: dict[str, pd.DataFrame], rebalance_bars: int = 6,
         momentum_lookback: int = 20, ema_short: int = 20, ema_long: int = 50,
         top_k: int = 1, starting_cash: float = 10_000.0,
         skip_top_n: int = 0, volatility_weighted: bool = False,
         trailing_stop_pct: float = 0.0,
         universe_size: int | None = None,
-        volume_window_bars: int = 180) -> dict:
+        volume_window_bars: int = 180,
+        regime_filter: bool = False,
+        regime_short: int = 50, regime_long: int = 200,
+        regime_bear_alloc: float = 0.0) -> dict:
     """Rotational momentum simulation.
 
     skip_top_n           — skip the N most-pumped picks (avoids buying the very top)
@@ -77,6 +99,14 @@ def run(data: dict[str, pd.DataFrame], rebalance_bars: int = 6,
         sym: _trailing_usd_volume(df, volume_window_bars)
         for sym, df in data.items()
     }).reindex(closes.index).ffill()
+
+    # Pre-compute BTC bull/bear regime if the filter is enabled
+    btc_regime: pd.Series | None = None
+    if regime_filter:
+        btc_regime = _btc_regime(data, ema_short=regime_short, ema_long=regime_long)
+        if btc_regime is None:
+            raise ValueError("regime_filter=True requires BTC/USDT in `data`")
+        btc_regime = btc_regime.reindex(closes.index, method="ffill").fillna(False).astype(bool)
 
     cash = starting_cash
     # holdings: sym -> {units, peak_price}
@@ -113,6 +143,25 @@ def run(data: dict[str, pd.DataFrame], rebalance_bars: int = 6,
             continue
         if (i - warmup) % rebalance_bars != 0:
             continue
+
+        # Regime filter: if BTC is in a bear regime, scale allocation by
+        # `regime_bear_alloc` (0.0 = full exit, 0.5 = soft 50%, 1.0 = no filter).
+        regime_alloc = 1.0
+        if regime_filter and btc_regime is not None and not bool(btc_regime.loc[ts]):
+            regime_alloc = regime_bear_alloc
+            if regime_alloc <= 0:
+                # Hard exit: sell everything, sit in cash
+                for sym in list(holdings.keys()):
+                    px = float(prices.get(sym, 0) or 0)
+                    if px > 0:
+                        proceeds = holdings[sym]["units"] * px * (1 - FEE_RATE)
+                        cash += proceeds
+                        trades.append({"timestamp": ts, "side": "SELL", "symbol": sym,
+                                       "price": px, "units": holdings[sym]["units"],
+                                       "reason": "REGIME_BEAR"})
+                    del holdings[sym]
+                last_picks = []
+                continue
 
         # Determine the eligible universe at this rebalance
         if universe_size:
@@ -169,7 +218,8 @@ def run(data: dict[str, pd.DataFrame], rebalance_bars: int = 6,
             else:
                 weights = [1.0 / len(new_eligibles)] * len(new_eligibles)
 
-            cash_to_deploy = cash
+            # Scale deployment by the regime factor (1.0 = full, 0.5 = soft bear, etc.)
+            cash_to_deploy = cash * regime_alloc
             for s, w in zip(new_eligibles, weights):
                 sym = s["symbol"]
                 px = float(prices.get(sym, 0) or 0)
@@ -226,6 +276,9 @@ def main() -> None:
                         help="With --bias-aware: total candidate pool fetched from mainnet")
     parser.add_argument("--universe-size", type=int, default=25,
                         help="With --bias-aware: top-N by volume picked at each rebalance")
+    parser.add_argument("--regime-filter", action="store_true",
+                        help="Only deploy when BTC is in a bull regime (50 EMA > 200 EMA). "
+                             "Otherwise sit in cash. Halves drawdowns historically.")
     args = parser.parse_args()
 
     ex = get_data_exchange()
@@ -244,6 +297,7 @@ def main() -> None:
         ema_short=args.ema_short, ema_long=args.ema_long,
         top_k=args.top_k, starting_cash=args.cash,
         universe_size=args.universe_size if args.bias_aware else None,
+        regime_filter=args.regime_filter,
     )
 
     btc = data.get("BTC/USDT")

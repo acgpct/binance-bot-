@@ -29,6 +29,9 @@ from pathlib import Path
 
 import ccxt
 
+import pandas as pd
+
+from src.data import fetch_history
 from src.exchange import get_data_exchange, get_exchange, is_live
 from src.scanner import get_universe, scan
 
@@ -108,6 +111,25 @@ def market_buy_quote(exchange: ccxt.Exchange, symbol: str, quote_amount: float) 
     except Exception as e:  # noqa: BLE001
         log.error(f"  BUY {symbol} (${quote_amount:.2f}) failed: {e}")
         return None
+
+
+def compute_btc_regime(data_exchange: ccxt.Exchange, timeframe: str = "4h",
+                       ema_short: int = 50, ema_long: int = 200) -> tuple[bool, float]:
+    """Returns (is_bull, ratio) where:
+      is_bull = True if BTC's short EMA > long EMA (mainnet data)
+      ratio   = (short_ema / long_ema - 1) × 100, for logging context
+
+    Used by the soft regime filter to scale capital deployment during risky
+    macro regimes.
+    """
+    df = fetch_history(data_exchange, "BTC/USDT", timeframe=timeframe, days=60)
+    if len(df) < ema_long + 5:
+        return True, 0.0  # not enough data — assume bull (don't restrict)
+    short = df["close"].ewm(span=ema_short, adjust=False).mean()
+    long_ = df["close"].ewm(span=ema_long, adjust=False).mean()
+    is_bull = bool(short.iloc[-1] > long_.iloc[-1])
+    ratio = float((short.iloc[-1] / long_.iloc[-1] - 1) * 100)
+    return is_bull, ratio
 
 
 def equity_usdt(exchange: ccxt.Exchange, holdings: dict, quote: str = "USDT") -> tuple[float, float]:
@@ -218,6 +240,23 @@ def rebalance(data_exchange: ccxt.Exchange, trade_exchange: ccxt.Exchange,
     if not args.dry_run:
         save_state(state)
 
+    # Optional: macro risk-on/risk-off filter. Scales capital deployment
+    # during BTC bear regimes without liquidating existing positions.
+    regime_alloc = 1.0
+    if args.regime_filter:
+        try:
+            is_bull, ratio = compute_btc_regime(
+                data_exchange, ema_short=args.regime_short,
+                ema_long=args.regime_long,
+            )
+            log.info(f"BTC regime: short EMA {ratio:+.2f}% vs long EMA → "
+                     f"{'BULL' if is_bull else 'BEAR'}")
+            if not is_bull:
+                regime_alloc = args.regime_bear_alloc
+                log.info(f"  Risk-off — deploying only {regime_alloc * 100:.0f}% of free cash")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"  regime check failed: {e}; defaulting to full allocation")
+
     picks = pick_targets(data_exchange, trade_exchange,
                          universe_size=args.universe, timeframe=args.timeframe,
                          days=args.days, momentum_lookback=args.momentum_lookback,
@@ -265,8 +304,8 @@ def rebalance(data_exchange: ccxt.Exchange, trade_exchange: ccxt.Exchange,
         log.info("No new picks to buy.")
     else:
         cash_after_sells, _ = equity_usdt(trade_exchange, holdings)
-        # Reserve a tiny buffer for fees & rounding
-        deployable = max(cash_after_sells * 0.995, 0)
+        # Reserve a tiny buffer for fees & rounding, then apply the regime scaler
+        deployable = max(cash_after_sells * 0.995 * regime_alloc, 0)
         cash_per_pick = deployable / len(new_picks)
         log.info(f"Deploying ${deployable:.2f} across {len(new_picks)} new picks "
                  f"(${cash_per_pick:.2f} each)")
@@ -342,6 +381,19 @@ def main() -> None:
                         help="Simulate the full rebalance, persist state, but place no orders.")
     parser.add_argument("--once", action="store_true",
                         help="Run a single rebalance cycle then exit.")
+    # Macro regime filter (soft): scales new-cash deployment in BTC bear regimes
+    parser.add_argument("--regime-filter", action="store_true",
+                        help="Enable BTC bull/bear regime filter — scales new "
+                             "deployment by --regime-bear-alloc when BTC is in "
+                             "a bear regime (4h short EMA < long EMA).")
+    parser.add_argument("--regime-bear-alloc", type=float, default=0.5,
+                        help="Fraction of free cash to deploy in bear regime "
+                             "(0.0 = full exit, 0.5 = soft, 1.0 = no filter). "
+                             "Backtests favor 0.5.")
+    parser.add_argument("--regime-short", type=int, default=50,
+                        help="Short EMA span for BTC regime detection (4h bars)")
+    parser.add_argument("--regime-long", type=int, default=200,
+                        help="Long EMA span for BTC regime detection (4h bars)")
     args = parser.parse_args()
 
     data_exchange = get_data_exchange()
