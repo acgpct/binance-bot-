@@ -459,6 +459,26 @@ bash deploy/sync_from_vps.sh <VPS-IP>
 # Then refresh the dashboard tab
 ```
 
+### Set-and-forget automation (recommended)
+
+Two scripts that remove the need to ever open a terminal again:
+
+**Auto-sync** — Mac launchd job pulls VPS state every 30 min. Dashboard always fresh, no manual `sync_from_vps.sh`:
+
+```bash
+# On your Mac. Requires passwordless SSH key set up (ssh-copy-id root@<vps-ip>)
+bash tools/install_auto_sync.sh
+```
+
+**Auto-heal** — VPS-side hourly cron that restarts the bot if `last_rebalance` is older than 26h. Replaces the manual "bot is Late → SSH → restart" routine:
+
+```bash
+# On the VPS as root, after `git pull`
+bash /home/botuser/binance-bot-/deploy/install_auto_heal.sh
+```
+
+After both are installed: the bot self-heals if it gets stuck, the dashboard auto-refreshes from VPS, and you only need to touch the terminal again if something is genuinely wrong.
+
 ### Weekly summary notification (macOS)
 
 Get a desktop notification every Sunday at 18:00 with your weekly P&L,
